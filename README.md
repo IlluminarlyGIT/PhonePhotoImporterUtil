@@ -1,6 +1,6 @@
 # Phone Photo Importer & Sorter
 
-A high-performance, safety-first desktop utility built with Python and Tkinter designed to scan, organize, and back up JPEG photos from Android phones (via ADB) or local/mounted drives into neatly structured, chronological date folders.
+A high-performance, safety-first desktop utility built with Python and Tkinter designed to scan, organize, and back up photos and videos (.jpg, .jpeg, .heic, .mp4) from Android phones (via ADB) or local/mounted drives into neatly structured, chronological date folders.
 
 ---
 
@@ -36,13 +36,19 @@ A high-performance, safety-first desktop utility built with Python and Tkinter d
 4. **Human-in-the-Loop Safe Clean-Up:**
    - Deletion is completely decoupled from copying.
    - Files on the phone are **only eligible for deletion if an exact copy (matching filename and identical byte size) is verified in the backup folder**.
-   - Selective targeting allows you to clear WhatsApp images to reclaim space while keeping your Camera roll untouched.
+   - Selective targeting allows you to clear WhatsApp images or WhatsApp video folders to reclaim space while keeping your Camera roll untouched.
 5. **Specialized WhatsApp & Android Support:**
    - Detects standard and multi-account WhatsApp paths (e.g., `/Android/media/com.whatsapp/WhatsApp/accounts/...`).
-   - Parses dates from filenames (e.g., `IMG-YYYYMMDD-WA...`) even when EXIF metadata has been stripped by messaging apps.
+   - Parses dates from filenames (e.g., `IMG-YYYYMMDD-WA...`, `VID-YYYYMMDD-WA...`) even when EXIF metadata has been stripped by messaging apps.
+   - Presets for both WhatsApp Images and WhatsApp Videos.
    - Automatically ignores `.thumbnails`, `.trashed`, `.cache`, and hidden system files.
-6. **Chronological Folder Organization:**
-   - Sorts photos by year, month, week, or day.
+6. **Pure-Python Media & Metadata Engine (.jpg, .jpeg, .heic, .mp4):**
+   - Zero external binary dependencies (no Pillow, libheif, or ffmpeg needed).
+   - Direct binary EXIF reader for JPEG images (`read_jpeg_exif_datetime`).
+   - ISO-BMFF container & TIFF IFD parser for Apple/Android `.heic` photos (`read_heic_exif_datetime`).
+   - QuickTime / ISO-BMFF atom parser (`moov` ➔ `mvhd`) for `.mp4` video creation timestamps (`read_mp4_creation_datetime`).
+7. **Chronological Folder Organization:**
+   - Sorts photos and videos by year, month, week, or day.
    - Uses numbered month names (e.g., `1. January`, `2. February`, ..., `12. December`) so that Windows File Explorer displays them chronologically rather than alphabetically.
 
 ---
@@ -184,8 +190,11 @@ The interface is structured into six numbered sections:
   - `index_target_folder()`: Creates an in-memory dictionary (`lowercase_filename -> set(file_sizes)`) for instant O(1) duplicate checks.
   - `get_free_disk_space()`: Uses `shutil.disk_usage` on the target volume.
   - `extract_photo_date()`: Multi-tier fallback date detector:
-    1. EXIF metadata via direct binary parsing (`read_jpeg_exif_datetime`).
-    2. Filename timestamp patterns (`IMG_YYYYMMDD_...`, `IMG-YYYYMMDD-WA...`).
+    1. Direct binary metadata extraction:
+       - JPEG: `read_jpeg_exif_datetime`
+       - HEIC: `read_heic_exif_datetime` (ISO-BMFF + TIFF IFD parser)
+       - MP4: `read_mp4_creation_datetime` (`moov`/`mvhd` atom header parser)
+    2. Filename timestamp patterns (`IMG_YYYYMMDD_...`, `VID_YYYYMMDD_...`, `IMG-YYYYMMDD-WA...`, `VID-YYYYMMDD-WA...`).
     3. File system modification time.
   - `resolve_collision_path()`: Safely appends incremental counter suffixes (`_1`, `_2`) if different images share identical file names.
 

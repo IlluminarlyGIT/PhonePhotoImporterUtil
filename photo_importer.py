@@ -3,7 +3,7 @@
 Phone Photo Importer & Sorter
 =============================
 A modern, production-ready desktop utility built with Python and Tkinter
-to recursively scan, organize, and sort JPEG photos from an Android device
+to recursively scan, organize, and sort photos and videos (.jpg, .jpeg, .heic, .mp4) from an Android device
 (via ADB or local/mounted folders) into a customizable date-structured external drive.
 
 Key Capabilities:
@@ -54,8 +54,11 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 
 # ==============================================================================
-# TARGET DIRECTORY INDEXING (INCREMENTAL BACKUP & VERIFIED CLEANUP)
+# SUPPORTED MEDIA FORMATS & TARGET DIRECTORY INDEXING
 # ==============================================================================
+
+SUPPORTED_MEDIA_EXTENSIONS = (".jpg", ".jpeg", ".heic", ".mp4")
+
 
 def index_target_folder(target_dir: str) -> dict[str, set[int]]:
     """
@@ -71,7 +74,7 @@ def index_target_folder(target_dir: str) -> dict[str, set[int]]:
 
     for root, _, files in os.walk(target_dir):
         for fname in files:
-            if fname.lower().endswith((".jpg", ".jpeg")):
+            if fname.lower().endswith(SUPPORTED_MEDIA_EXTENSIONS):
                 full_path = os.path.join(root, fname)
                 try:
                     sz = os.path.getsize(full_path)
@@ -285,8 +288,8 @@ def detect_phone_media_folders(adb_bin: str, serial: str | None, default_presets
 
 
 def parse_date_from_filename(filename: str) -> datetime.date | None:
-    """Extracts date from camera & WhatsApp photo filenames."""
-    match = re.search(r"(?:IMG[-_]|PANO[-_]|Screenshot[-_]|VID[-_]|WA[-_])?(\d{4})[-_]?(\d{2})[-_]?(\d{2})", filename, re.IGNORECASE)
+    """Extracts date from camera & WhatsApp photo/video filenames."""
+    match = re.search(r"(?:IMG[-_]|PANO[-_]|Screenshot[-_]|VID[-_]|WA[-_]|MOV[-_]|REC[-_])?(\d{4})[-_]?(\d{2})[-_]?(\d{2})", filename, re.IGNORECASE)
     if match:
         try:
             year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
@@ -305,7 +308,7 @@ def adb_scan_camera_photos(
     target_index: dict[str, set[int]] | None = None
 ) -> tuple[list[tuple[str, int]], int, int, int]:
     """
-    Finds valid JPEG photos on the Android device along with their file sizes.
+    Finds valid photos and videos on the Android device along with their file sizes.
     Correctly handles spaces in directory names (e.g. 'WhatsApp Images').
     """
     norm_folder = normalize_phone_path(phone_folder)
@@ -350,7 +353,7 @@ def adb_scan_camera_photos(
         else:
             file_path = line
 
-        if not file_path.lower().endswith((".jpg", ".jpeg")):
+        if not file_path.lower().endswith(SUPPORTED_MEDIA_EXTENSIONS):
             continue
 
         path_parts = file_path.split("/")
@@ -381,14 +384,81 @@ def adb_scan_camera_photos(
 
 
 # ==============================================================================
-# CORE LOGIC & PURE-PYTHON EXIF PARSER
+# CORE LOGIC & PURE-PYTHON METADATA PARSER (JPEG, HEIC, MP4)
 # ==============================================================================
+
+def parse_tiff_datetime(tiff: bytes) -> str | None:
+    """
+    Parses a TIFF byte structure (starting with 'II*' or 'MM*')
+    to extract DateTimeOriginal (0x9003), DateTimeDigitized (0x9004), or DateTime (0x0132).
+    """
+    if len(tiff) < 8:
+        return None
+    byte_order = tiff[:2]
+    if byte_order == b"II":
+        endian = "<"
+    elif byte_order == b"MM":
+        endian = ">"
+    else:
+        return None
+
+    if struct.unpack(endian + "H", tiff[2:4])[0] != 42:
+        return None
+
+    ifd0_offset = struct.unpack(endian + "I", tiff[4:8])[0]
+
+    def _parse_ifd(ifd_off: int) -> dict[int, tuple[int, int, bytes]]:
+        tags: dict[int, tuple[int, int, bytes]] = {}
+        if ifd_off + 2 > len(tiff):
+            return tags
+        count_entries = struct.unpack(endian + "H", tiff[ifd_off : ifd_off + 2])[0]
+        pos = ifd_off + 2
+        for _ in range(count_entries):
+            if pos + 12 > len(tiff):
+                break
+            tag_id, fmt, cnt = struct.unpack(endian + "HHI", tiff[pos : pos + 8])
+            raw_val = tiff[pos + 8 : pos + 12]
+            tags[tag_id] = (fmt, cnt, raw_val)
+            pos += 12
+        return tags
+
+    def _read_ascii(entry: tuple[int, int, bytes]) -> str | None:
+        fmt, cnt, raw_val = entry
+        if fmt != 2 or cnt <= 0:
+            return None
+        if cnt <= 4:
+            data = raw_val[:cnt]
+        else:
+            str_off = struct.unpack(endian + "I", raw_val)[0]
+            if str_off + cnt > len(tiff):
+                return None
+            data = tiff[str_off : str_off + cnt]
+        return data.decode("ascii", errors="ignore").strip("\x00").strip()
+
+    ifd0 = _parse_ifd(ifd0_offset)
+    # Check Exif SubIFD (0x8769 = 34665) first for DateTimeOriginal (36867) / DateTimeDigitized (36868)
+    if 34665 in ifd0:
+        exif_sub_off = struct.unpack(endian + "I", ifd0[34665][2])[0]
+        exif_ifd = _parse_ifd(exif_sub_off)
+        for t_id in (36867, 36868):
+            if t_id in exif_ifd:
+                dt_str = _read_ascii(exif_ifd[t_id])
+                if dt_str:
+                    return dt_str
+
+    # Fallback to IFD0 DateTimeOriginal / DateTime (306)
+    for t_id in (36867, 36868, 306):
+        if t_id in ifd0:
+            dt_str = _read_ascii(ifd0[t_id])
+            if dt_str:
+                return dt_str
+    return None
+
 
 def read_jpeg_exif_datetime(filepath: str) -> str | None:
     """
     Pure-Python binary JPEG EXIF header parser using standard 'struct'.
-    Reads only the header bytes to extract DateTimeOriginal (0x9003),
-    DateTimeDigitized (0x9004), or DateTime (0x0132) without needing Pillow.
+    Reads only header APP1 bytes without needing Pillow.
     """
     try:
         with open(filepath, "rb") as f:
@@ -423,65 +493,7 @@ def read_jpeg_exif_datetime(filepath: str) -> str | None:
                 if marker == 0xE1:  # APP1 Segment
                     payload = f.read(seg_len - 2)
                     if len(payload) >= 14 and payload[:6] == b"Exif\x00\x00":
-                        tiff = payload[6:]
-                        byte_order = tiff[:2]
-                        if byte_order == b"II":
-                            endian = "<"
-                        elif byte_order == b"MM":
-                            endian = ">"
-                        else:
-                            continue
-
-                        if struct.unpack(endian + "H", tiff[2:4])[0] != 42:
-                            continue
-
-                        ifd0_offset = struct.unpack(endian + "I", tiff[4:8])[0]
-
-                        def _parse_ifd(ifd_off: int) -> dict[int, tuple[int, int, bytes]]:
-                            tags: dict[int, tuple[int, int, bytes]] = {}
-                            if ifd_off + 2 > len(tiff):
-                                return tags
-                            count_entries = struct.unpack(endian + "H", tiff[ifd_off : ifd_off + 2])[0]
-                            pos = ifd_off + 2
-                            for _ in range(count_entries):
-                                if pos + 12 > len(tiff):
-                                    break
-                                tag_id, fmt, cnt = struct.unpack(endian + "HHI", tiff[pos : pos + 8])
-                                raw_val = tiff[pos + 8 : pos + 12]
-                                tags[tag_id] = (fmt, cnt, raw_val)
-                                pos += 12
-                            return tags
-
-                        def _read_ascii(entry: tuple[int, int, bytes]) -> str | None:
-                            fmt, cnt, raw_val = entry
-                            if fmt != 2 or cnt <= 0:
-                                return None
-                            if cnt <= 4:
-                                data = raw_val[:cnt]
-                            else:
-                                str_off = struct.unpack(endian + "I", raw_val)[0]
-                                if str_off + cnt > len(tiff):
-                                    return None
-                                data = tiff[str_off : str_off + cnt]
-                            return data.decode("ascii", errors="ignore").strip("\x00").strip()
-
-                        ifd0 = _parse_ifd(ifd0_offset)
-                        # Check Exif SubIFD (0x8769 = 34665) first for DateTimeOriginal (36867) / DateTimeDigitized (36868)
-                        if 34665 in ifd0:
-                            exif_sub_off = struct.unpack(endian + "I", ifd0[34665][2])[0]
-                            exif_ifd = _parse_ifd(exif_sub_off)
-                            for t_id in (36867, 36868):
-                                if t_id in exif_ifd:
-                                    dt_str = _read_ascii(exif_ifd[t_id])
-                                    if dt_str:
-                                        return dt_str
-
-                        # Fallback to IFD0 DateTimeOriginal / DateTime (306)
-                        for t_id in (36867, 36868, 306):
-                            if t_id in ifd0:
-                                dt_str = _read_ascii(ifd0[t_id])
-                                if dt_str:
-                                    return dt_str
+                        return parse_tiff_datetime(payload[6:])
                 else:
                     f.seek(seg_len - 2, os.SEEK_CUR)
     except Exception:
@@ -489,27 +501,150 @@ def read_jpeg_exif_datetime(filepath: str) -> str | None:
     return None
 
 
+def read_heic_exif_datetime(filepath: str) -> str | None:
+    """
+    Pure-Python EXIF reader for HEIC files.
+    Reads container header block (up to first 256KB) to find Exif payload or TIFF header.
+    """
+    try:
+        with open(filepath, "rb") as f:
+            hdr = f.read(12)
+            if len(hdr) < 12 or hdr[4:8] != b"ftyp":
+                return None
+            f.seek(0)
+            chunk = f.read(262144)
+
+        exif_pos = chunk.find(b"Exif\x00\x00")
+        if exif_pos != -1 and exif_pos + 6 < len(chunk):
+            dt = parse_tiff_datetime(chunk[exif_pos + 6 :])
+            if dt:
+                return dt
+
+        for magic in (b"II\x2a\x00", b"MM\x00\x2a"):
+            pos = 0
+            while True:
+                idx = chunk.find(magic, pos)
+                if idx == -1:
+                    break
+                dt = parse_tiff_datetime(chunk[idx:])
+                if dt:
+                    return dt
+                pos = idx + 1
+    except Exception:
+        pass
+    return None
+
+
+def read_mp4_creation_datetime(filepath: str) -> datetime.datetime | None:
+    """
+    Pure-Python parser for MP4/MOV container creation time.
+    Locates the 'moov' -> 'mvhd' atom and extracts creation_time (seconds since Jan 1 1904 UTC).
+    """
+    try:
+        with open(filepath, "rb") as f:
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                box_sz, box_type = struct.unpack(">I4s", hdr)
+                if box_sz == 1:
+                    ext_sz = f.read(8)
+                    if len(ext_sz) < 8:
+                        break
+                    box_sz = struct.unpack(">Q", ext_sz)[0]
+                    hdr_len = 16
+                else:
+                    hdr_len = 8
+
+                if box_sz < hdr_len and box_sz != 0:
+                    break
+
+                if box_type == b"moov":
+                    payload_len = box_sz - hdr_len if box_sz != 0 else 1048576
+                    moov_data = f.read(payload_len)
+                    pos = 0
+                    while pos + 8 <= len(moov_data):
+                        sub_sz, sub_type = struct.unpack(">I4s", moov_data[pos : pos + 8])
+                        if sub_sz == 1 and pos + 16 <= len(moov_data):
+                            sub_sz = struct.unpack(">Q", moov_data[pos + 8 : pos + 16])[0]
+                            sub_hdr_len = 16
+                        else:
+                            sub_hdr_len = 8
+
+                        if sub_type == b"mvhd" and pos + sub_hdr_len + 12 <= len(moov_data):
+                            version = moov_data[pos + sub_hdr_len]
+                            if version == 0:
+                                ctime = struct.unpack(">I", moov_data[pos + sub_hdr_len + 4 : pos + sub_hdr_len + 8])[0]
+                            else:
+                                if pos + sub_hdr_len + 20 <= len(moov_data):
+                                    ctime = struct.unpack(">Q", moov_data[pos + sub_hdr_len + 4 : pos + sub_hdr_len + 12])[0]
+                                else:
+                                    ctime = 0
+
+                            # 2082844800 is seconds between 1904-01-01 and 1970-01-01
+                            if ctime > 2082844800:
+                                utc_ts = ctime - 2082844800
+                                dt = datetime.datetime.fromtimestamp(utc_ts, datetime.timezone.utc).replace(tzinfo=None)
+                                if 1990 <= dt.year <= 2100:
+                                    return dt
+                            break
+
+                        if sub_sz <= 0 or pos + sub_sz > len(moov_data):
+                            break
+                        pos += sub_sz
+                    break
+                elif box_sz == 0:
+                    break
+                else:
+                    f.seek(box_sz - hdr_len, os.SEEK_CUR)
+    except Exception:
+        pass
+    return None
+
+
 def extract_photo_date(filepath: str) -> tuple[datetime.datetime, str]:
-    """Reads capture date from EXIF, WhatsApp filename date, or filesystem timestamp."""
-    raw_date_str = read_jpeg_exif_datetime(filepath)
+    """Reads capture date from EXIF, MP4 metadata, filename date, or filesystem timestamp."""
+    lower_path = filepath.lower()
 
-    if raw_date_str and isinstance(raw_date_str, str):
-        cleaned_str = raw_date_str.strip().replace("\x00", "")
-        for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y:%m:%d", "%Y-%m-%d"):
-            try:
-                parsed_dt = datetime.datetime.strptime(cleaned_str, fmt)
-                if parsed_dt.year > 1970:
-                    return parsed_dt, "EXIF DateTimeOriginal"
-            except ValueError:
-                continue
+    # 1. MP4 container metadata
+    if lower_path.endswith(".mp4"):
+        mp4_dt = read_mp4_creation_datetime(filepath)
+        if mp4_dt:
+            return mp4_dt, "MP4 CreationTime"
 
-    # Fallback: Date from filename (WhatsApp photos)
+    # 2. HEIC EXIF metadata
+    if lower_path.endswith(".heic"):
+        raw_date_str = read_heic_exif_datetime(filepath)
+        if raw_date_str and isinstance(raw_date_str, str):
+            cleaned_str = raw_date_str.strip().replace("\x00", "")
+            for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y:%m:%d", "%Y-%m-%d"):
+                try:
+                    parsed_dt = datetime.datetime.strptime(cleaned_str, fmt)
+                    if parsed_dt.year > 1970:
+                        return parsed_dt, "HEIC EXIF DateTimeOriginal"
+                except ValueError:
+                    continue
+
+    # 3. JPEG EXIF metadata
+    if lower_path.endswith((".jpg", ".jpeg")):
+        raw_date_str = read_jpeg_exif_datetime(filepath)
+        if raw_date_str and isinstance(raw_date_str, str):
+            cleaned_str = raw_date_str.strip().replace("\x00", "")
+            for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y:%m:%d", "%Y-%m-%d"):
+                try:
+                    parsed_dt = datetime.datetime.strptime(cleaned_str, fmt)
+                    if parsed_dt.year > 1970:
+                        return parsed_dt, "EXIF DateTimeOriginal"
+                except ValueError:
+                    continue
+
+    # 4. Fallback: Date from filename (Camera & WhatsApp)
     fn = os.path.basename(filepath)
     fn_date = parse_date_from_filename(fn)
     if fn_date:
         return datetime.datetime(fn_date.year, fn_date.month, fn_date.day, 12, 0, 0), "Filename Date (WhatsApp/Camera)"
 
-    # Fallback: Filesystem timestamp
+    # 5. Fallback: Filesystem timestamp
     try:
         stat_info = os.stat(filepath)
         timestamps = [t for t in (stat_info.st_mtime, getattr(stat_info, "st_ctime", None)) if t and t > 0]
@@ -615,9 +750,12 @@ class PhotoImporterApp:
         "/sdcard/DCIM/Camera",
         "/sdcard/DCIM",
         "/sdcard/Android/media/com.whatsapp/WhatsApp/accounts/1005/media/WhatsApp Images",
+        "/sdcard/Android/media/com.whatsapp/WhatsApp/accounts/1005/media/WhatsApp Video",
         "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images",
+        "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video",
         "/sdcard/Pictures/WhatsApp",
         "/sdcard/Pictures",
+        "/sdcard/Movies",
         "/sdcard/Download",
     ]
 
@@ -1071,8 +1209,8 @@ class PhotoImporterApp:
 
         clean_info_lbl = ttk.Label(
             clean_card,
-            text="Select which folder on your phone to clean up (e.g., delete WhatsApp Images to save space, keeping DCIM/Camera safe).\n"
-                 "DOUBLE-SAFETY: A photo is ONLY deleted if an identical backup is confirmed in your target drive!",
+            text="Select which folder on your phone to clean up (e.g., delete WhatsApp Images or Videos to save space, keeping DCIM/Camera safe).\n"
+                 "DOUBLE-SAFETY: A file is ONLY deleted if an identical backup is confirmed in your target drive!",
             foreground="#334155",
             font=("Segoe UI", 8, "italic")
         )
@@ -1089,6 +1227,13 @@ class PhotoImporterApp:
             command=lambda: self._set_clean_preset("whatsapp")
         )
         self.btn_preset_clean_wa.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.btn_preset_clean_wavideo = ttk.Button(
+            clean_preset_row,
+            text="🎥 WhatsApp Video",
+            command=lambda: self._set_clean_preset("whatsapp_video")
+        )
+        self.btn_preset_clean_wavideo.pack(side=tk.LEFT, padx=(0, 4))
 
         self.btn_preset_clean_cam = ttk.Button(
             clean_preset_row,
@@ -1437,7 +1582,7 @@ class PhotoImporterApp:
             candidates = []
             for root_path, _, filenames in os.walk(clean_folder):
                 for fname in filenames:
-                    if fname.lower().endswith((".jpg", ".jpeg")):
+                    if fname.lower().endswith(SUPPORTED_MEDIA_EXTENSIONS):
                         fp = os.path.join(root_path, fname)
                         candidates.append((fp, os.path.getsize(fp)))
 
@@ -1554,12 +1699,20 @@ class PhotoImporterApp:
     def _set_clean_preset(self, preset: str):
         if preset == "whatsapp":
             for p in self.combo_clean_dir["values"]:
-                if "com.whatsapp" in p.lower() and "media" in p.lower():
+                if "com.whatsapp" in p.lower() and "images" in p.lower():
                     self.clean_folder_var.set(p)
                     self._log("INFO", f"Clean target toggled to WhatsApp Images: {p}")
                     return
             self.clean_folder_var.set(self.PHONE_PRESET_FOLDERS[2])
             self._log("INFO", f"Clean target toggled to WhatsApp Images: {self.PHONE_PRESET_FOLDERS[2]}")
+        elif preset == "whatsapp_video":
+            for p in self.combo_clean_dir["values"]:
+                if "com.whatsapp" in p.lower() and "video" in p.lower():
+                    self.clean_folder_var.set(p)
+                    self._log("INFO", f"Clean target toggled to WhatsApp Video: {p}")
+                    return
+            self.clean_folder_var.set(self.PHONE_PRESET_FOLDERS[3])
+            self._log("INFO", f"Clean target toggled to WhatsApp Video: {self.PHONE_PRESET_FOLDERS[3]}")
         elif preset == "camera":
             self.clean_folder_var.set("/sdcard/DCIM/Camera")
             self._log("INFO", "Clean target toggled to Phone Camera: /sdcard/DCIM/Camera")
@@ -1684,6 +1837,7 @@ class PhotoImporterApp:
         self.btn_safe_delete.config(state=state)
         self.btn_browse_clean.config(state=state)
         self.btn_preset_clean_wa.config(state=state)
+        self.btn_preset_clean_wavideo.config(state=state)
         self.btn_preset_clean_cam.config(state=state)
         self.btn_preset_clean_dcim.config(state=state)
         self.btn_preset_clean_pic.config(state=state)
@@ -1752,7 +1906,7 @@ class PhotoImporterApp:
             self.cancel_event.clear()
             self.progress_bar["value"] = 0
             self.progress_percent_var.set("0%")
-            self.status_var.set("Scanning local directory for JPEG photos...")
+            self.status_var.set("Scanning local directory for photos & videos...")
 
             self._log("INFO", "=" * 55)
             self._log("INFO", f"Starting LOCAL {'COPY' if is_copy_mode else 'MOVE'} import...")
@@ -1820,7 +1974,7 @@ class PhotoImporterApp:
                 if self.cancel_event.is_set():
                     break
                 for fname in filenames:
-                    if fname.lower().endswith((".jpg", ".jpeg")):
+                    if fname.lower().endswith(SUPPORTED_MEDIA_EXTENSIONS):
                         fp = os.path.join(root_path, fname)
                         try:
                             f_sz = os.path.getsize(fp)
@@ -2017,8 +2171,8 @@ class PhotoImporterApp:
                     total = payload
                     self.progress_bar["maximum"] = total
                     self.progress_bar["value"] = 0
-                    self.status_var.set(f"Found {total} new JPEG images to import. Processing...")
-                    self._log("INFO", f"Scan complete: {total} new photos ready to import.")
+                    self.status_var.set(f"Found {total} new media files to import. Processing...")
+                    self._log("INFO", f"Scan complete: {total} new media files ready to import.")
 
                 elif msg_type == "PROGRESS_UPDATE":
                     idx, total, filename = payload
@@ -2063,9 +2217,9 @@ class PhotoImporterApp:
 
                 elif msg_type == "NO_FILES":
                     self._set_ui_state(running=False)
-                    self.status_var.set("No new matching JPEG photos found.")
-                    self._log("INFO", "All photos in this folder are already backed up or outside the selected date range.")
-                    messagebox.showinfo("Scan Result", "No new JPEG photos to import!\n\nAll photos are either already in your target folder, outside the date range, or thumbnails.")
+                    self.status_var.set("No new matching photos or videos found.")
+                    self._log("INFO", "All photos and videos in this folder are already backed up or outside the selected date range.")
+                    messagebox.showinfo("Scan Result", "No new photos or videos to import!\n\nAll files are either already in your target folder, outside the date range, or thumbnails.")
 
                 elif msg_type == "INSUFFICIENT_SPACE":
                     req_bytes, free_bytes, t_dir = payload
