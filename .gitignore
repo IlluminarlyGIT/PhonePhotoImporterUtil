@@ -1,0 +1,18 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller build outputs
+build/
+dist/
+*.spec
+
+# Operating System files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor / IDE settings
+.vscode/
+.idea/
